@@ -328,6 +328,37 @@ def predict_next(models, past_draws, target_date, target_is_eve,
     return best[0], votes
 
 
+def parity_tweak(guess, votes, past_draws):
+    """Kass tweak (2026-10-24): bias the official pick toward 2-1 parity
+    splits — 2 even + 1 odd, or 2 odd + 1 even. Those two classes cover
+    75% of all draws (37.5% each), vs 12.5% each for all-even / all-odd.
+    A guess already in a 2-1 split is returned unchanged. Otherwise the
+    guess's least-supported digit (the one appearing in the fewest voter
+    picks) is swapped for the most frequent opposite-parity digit of the
+    last 60 draws. Returns (triple, changed?). Applied to the live daily
+    pick only — the walk-forward backtest keeps measuring the raw vote.
+    """
+    evens = sum(1 for d in guess if d % 2 == 0)
+    if evens in (1, 2):
+        return tuple(sorted(guess)), False
+    want_even = evens == 0  # all-odd -> add an even; all-even -> add an odd
+    support = {}
+    for v in votes.values():
+        for d in set(v):
+            support[d] = support.get(d, 0) + 1
+    drop = min(guess, key=lambda d: (support.get(d, 0), d))
+    freq = {}
+    for draw in past_draws[-60:]:
+        for d in draw[2:]:
+            freq[d] = freq.get(d, 0) + 1
+    repl = max((d for d in range(10) if (d % 2 == 0) == want_even),
+               key=lambda d: (freq.get(d, 0), -d))
+    out = list(guess)
+    out.remove(drop)
+    out.append(repl)
+    return tuple(sorted(out)), True
+
+
 # ---------------------------------------------------------------- backtest
 def backtest(df, features="v2", n_test=600, retrain_every=50):
     print(f"=== WALK-FORWARD BACKTEST ({features}, last {n_test} draws, "
@@ -441,6 +472,7 @@ def daily_run():
     for date, draw in next_draws(df):
         guess, parts = predict_next(models, draws, pd.Timestamp(date),
                                     draw == "eve")
+        guess, tweaked = parity_tweak(guess, parts, draws)
         new_rows.append({"date": str(date), "draw": draw,
                          "g1": guess[0], "g2": guess[1], "g3": guess[2],
                          "hot": "".join(map(str, parts["hot"])),
@@ -453,7 +485,8 @@ def daily_run():
             lane_rows.append({"date": str(date), "draw": draw, "lane": name,
                               "guess": "".join(map(str, g)),
                               "box_hit": "", "digits_right": ""})
-        print(f"  {date} {draw}: ensemble {''.join(map(str, guess))} "
+        print(f"  {date} {draw}: ensemble {''.join(map(str, guess))}"
+              f"{' (parity-tweaked)' if tweaked else ''} "
               f"(hot {''.join(map(str, parts['hot']))} / "
               f"rf {''.join(map(str, parts['rf']))} / "
               f"gb {''.join(map(str, parts['gb']))} / "
