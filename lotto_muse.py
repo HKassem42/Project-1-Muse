@@ -24,7 +24,13 @@ v2 changes (2026-10-21):
     A lane only means something if it beats the control lane.
 
 Usage:
-  python lotto_muse.py              daily run
+  python lotto_muse.py              morning run: score + predict MIDDAY only
+  python lotto_muse.py --evening    afternoon run: score + predict EVENING
+                                    only (after the midday result is in, so
+                                    the evening pick trains on it — Kass,
+                                    2026-10-29: mid/eve picks were landing
+                                    identical when both were made at 8 AM
+                                    from the same inputs)
   python lotto_muse.py --backtest   walk-forward backtest (v2)
   python lotto_muse.py --backtest --features v1   original recipe, for A/B
 """
@@ -458,7 +464,11 @@ def score_pending(df):
     return hist
 
 
-def daily_run():
+def daily_run(only=None):
+    """One pipeline run. `only` = "mid" (morning) or "eve" (afternoon)
+    restricts which upcoming draw gets predicted/logged; scoring and
+    training always use everything in history. Splitting the runs lets
+    the evening pick train on the same day's midday result."""
     df = update_history()
     draws = draws_list(df)
     print("[2/6] Scoring previous guesses + lanes...")
@@ -470,6 +480,8 @@ def daily_run():
     print("[4/6] Predicting next draws (ensemble + lanes)...")
     new_rows, lane_rows = [], []
     for date, draw in next_draws(df):
+        if only and draw != only:
+            continue
         guess, parts = predict_next(models, draws, pd.Timestamp(date),
                                     draw == "eve")
         guess, tweaked = parity_tweak(guess, parts, draws)
@@ -533,6 +545,8 @@ def daily_run():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--backtest", action="store_true")
+    ap.add_argument("--evening", action="store_true",
+                    help="afternoon run: predict the evening draw only")
     ap.add_argument("--features", default="v2", choices=["v1", "v2"])
     ap.add_argument("--n-test", type=int, default=600)
     args = ap.parse_args()
@@ -540,5 +554,5 @@ if __name__ == "__main__":
         df = update_history()
         backtest(df, features=args.features, n_test=args.n_test)
     else:
-        daily_run()
+        daily_run(only="eve" if args.evening else "mid")
     print("\nDone.")
