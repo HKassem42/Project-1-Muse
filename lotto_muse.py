@@ -1,4 +1,4 @@
-"""Lotto-Muse v2: Michigan Daily 3 experimental prediction engine.
+"""Lotto-Muse v3: Michigan Daily 3 experimental prediction engine.
 
 Fun research project. Lottery draws are independent random events, so no
 model is expected to beat chance -- the backtest and dashboard exist to
@@ -33,19 +33,49 @@ Usage:
                                     from the same inputs)
   python lotto_muse.py --backtest   walk-forward backtest (v2)
   python lotto_muse.py --backtest --features v1   original recipe, for A/B
+
+v3 changes (2026-11-04, Kass: "change whatever training knobs or style
+you need for it to be better"):
+  - INGESTION: history updates now merge the archive scrape with a FAST
+    layer (3 independent latest-results pages, 2-of-3 agreement), and
+    the afternoon run WAITS for today's midday result (polling the fast
+    layer) instead of training the evening pick on stale data. Existing
+    history rows can no longer be silently overwritten by a scrape.
+  - GUESS CONSTRUCTION: the official pick is now a 3-DISTINCT-digit set
+    chosen to maximize a blended digit score, instead of a majority vote
+    over whole triples (which could repeat a digit). Under order-free
+    scoring this is provably the best pattern class (brute-forced over
+    all 1,000 outcomes): a distinct set boxes at 0.60% and expects
+    0.813 digits/draw, vs 0.30% / 0.570 for a pair and 0.10% / 0.300
+    for a triple. The old parity tweak is retired as the main rule and
+    survives only as a tie-breaker-scale bonus for 2-1 parity sets
+    (score-neutral among distinct sets).
+  - TRAINING TARGET: alongside the sorted-position models (kept as
+    voters, their per-position probabilities summed into per-digit
+    expected counts), the engine now also trains per-digit BINARY
+    classifiers — "does digit d appear in the next draw?" — which is
+    the quantity the order-free score actually rewards.
 """
 import argparse
 import hashlib
+import itertools
 import pickle
 import random
-from datetime import timedelta
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 
-from scraper import scrape_daily3
+from scraper import scrape_daily3, scrape_fast_latest
+
+DETROIT = ZoneInfo("America/Detroit")
+MIDDAY_WAIT_MIN = 75     # afternoon run: max minutes to wait for the
+                         # same-day midday result before falling back
+MIDDAY_POLL_SEC = 180    # re-check the fast sources every 3 minutes
 
 BASE = Path(__file__).parent
 DATA_FILE = BASE / "data" / "history.csv"
@@ -71,23 +101,92 @@ def load_history() -> pd.DataFrame:
     return pd.DataFrame(columns=["date", "draw", "d1", "d2", "d3"])
 
 
-def update_history() -> pd.DataFrame:
-    """Scrape latest results and merge into history.csv. Fails loudly."""
-    print("[1/6] Updating history...")
-    existing = load_history()
-    fresh = scrape_daily3()
+def _merge_frames(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
+    """Merge scraped rows into history. EXISTING rows always win: a
+    scrape that disagrees with a recorded draw is reported as a
+    conflict, never silently overwritten (pre-2026-11-04 the merge used
+    keep='last', so a bad scrape could rewrite history)."""
     if fresh is None or len(fresh) == 0:
-        if len(existing) == 0:
-            raise SystemExit(
-                "ERROR: scraper returned no data and no history exists. "
-                "Refusing to train on fake data.")
-        print(f"  scraper returned nothing new; keeping {len(existing)} draws")
         return existing
+    fresh = fresh.copy()
+    fresh["date"] = pd.to_datetime(fresh["date"])
+    if len(existing):
+        have = {(pd.Timestamp(r["date"]).date(), r["draw"]):
+                (int(r["d1"]), int(r["d2"]), int(r["d3"]))
+                for _, r in existing.iterrows()}
+        for _, r in fresh.iterrows():
+            key = (pd.Timestamp(r["date"]).date(), r["draw"])
+            val = (int(r["d1"]), int(r["d2"]), int(r["d3"]))
+            if key in have and have[key] != val:
+                print(f"  CONFLICT {key}: history has "
+                      f"{''.join(map(str, have[key]))}, scrape says "
+                      f"{''.join(map(str, val))} — keeping history")
     combined = (pd.concat([existing, fresh])
                   .assign(_o=lambda df: df["draw"].map({"mid": 0, "eve": 1}))
-                  .drop_duplicates(subset=["date", "draw"], keep="last")
+                  .drop_duplicates(subset=["date", "draw"], keep="first")
                   .sort_values(["date", "_o"]).drop(columns="_o")
                   .reset_index(drop=True))
+    return combined
+
+
+def update_history(wait_for_midday: bool = False) -> pd.DataFrame:
+    """Scrape latest results and merge into history.csv. Fails loudly.
+
+    Layers: the Lottery Valley archive (~30 days) plus the FAST layer
+    (3 independent latest-results pages, 2-of-3 agreement required —
+    see scraper.scrape_fast_latest). With wait_for_midday (afternoon
+    run), poll the fast layer every few minutes until today's midday
+    draw is in history, up to MIDDAY_WAIT_MIN minutes, so the evening
+    pick trains on it instead of yesterday's data."""
+    print("[1/6] Updating history...")
+    existing = load_history()
+    frames, got = [], False
+    try:
+        frames.append(scrape_daily3())
+        got = True
+    except Exception as e:
+        print(f"  archive scrape failed ({type(e).__name__}: {e})")
+    try:
+        fast, report = scrape_fast_latest()
+        frames.append(fast)
+        got = got or len(fast) > 0
+        latest = (f"{fast['date'].max().date()} {fast.iloc[-1]['draw']} "
+                  f"{fast.iloc[-1]['d1']}{fast.iloc[-1]['d2']}"
+                  f"{fast.iloc[-1]['d3']}" if len(fast) else "none")
+        print(f"  fast layer: {len(fast)} verified latest draws "
+              f"(newest: {latest})"
+              + (f"; source errors: {report['errors']}"
+                 if report["errors"] else ""))
+    except Exception as e:
+        print(f"  fast layer failed ({type(e).__name__}: {e})")
+    if not got and len(existing) == 0:
+        raise SystemExit(
+            "ERROR: scrapers returned no data and no history exists. "
+            "Refusing to train on fake data.")
+    combined = existing
+    for f in frames:
+        combined = _merge_frames(combined, f)
+    if wait_for_midday:
+        today = datetime.now(DETROIT).date()
+        have = {(pd.Timestamp(r["date"]).date(), r["draw"])
+                for _, r in combined.iterrows()}
+        deadline = time.time() + MIDDAY_WAIT_MIN * 60
+        while (today, "mid") not in have and time.time() < deadline:
+            print(f"  midday {today} not posted yet — waiting "
+                  f"{MIDDAY_POLL_SEC // 60} min and re-checking fast "
+                  "sources...")
+            time.sleep(MIDDAY_POLL_SEC)
+            try:
+                fast, _ = scrape_fast_latest()
+                combined = _merge_frames(combined, fast)
+            except Exception as e:
+                print(f"  fast re-check failed ({type(e).__name__}: {e})")
+            have = {(pd.Timestamp(r["date"]).date(), r["draw"])
+                    for _, r in combined.iterrows()}
+        if (today, "mid") not in have:
+            print(f"  WARNING: midday {today} still not verified after "
+                  f"{MIDDAY_WAIT_MIN} min — proceeding on stale data "
+                  "(evening pick will NOT include today's midday)")
     combined.to_csv(DATA_FILE, index=False)
     print(f"  history: {len(combined)} draws "
           f"({combined['date'].min().date()} -> {combined['date'].max().date()})")
@@ -305,6 +404,23 @@ def train_models(draws, features="v2", train_n=TRAIN_N):
         gb.fit(X, Y[:, pos])
         models["gb"].append(gb)
 
+    # v3: per-digit binary classifiers — P(digit d appears in next draw).
+    # This is the quantity order-free scoring actually rewards.
+    Ybin = np.zeros((len(Y), 10), dtype=int)
+    for i, t in enumerate(Y):
+        for d in set(t):
+            Ybin[i, d] = 1
+    models["rfb"], models["gbb"] = [], []
+    for d in range(10):
+        rf = RandomForestClassifier(n_estimators=100, max_depth=10,
+                                    random_state=42, n_jobs=-1)
+        rf.fit(X, Ybin[:, d])
+        models["rfb"].append(rf)
+        gb = HistGradientBoostingClassifier(max_iter=150, learning_rate=0.06,
+                                            max_depth=3, random_state=42)
+        gb.fit(X, Ybin[:, d])
+        models["gbb"].append(gb)
+
     seq_len = 10
     seqs = [[list(d[2:]) for d in draws[i - seq_len:i]]
             for i in range(min_past, len(draws))]
@@ -314,9 +430,70 @@ def train_models(draws, features="v2", train_n=TRAIN_N):
     return models
 
 
+def _expected_counts(clfs, x):
+    """Sum per-position class probabilities into per-digit expected
+    counts: sum_p P(position p = d) = E[times digit d appears]."""
+    out = np.zeros(10)
+    for clf in clfs:
+        for cls, p in zip(clf.classes_, clf.predict_proba(x)[0]):
+            out[int(cls)] += p
+    return out
+
+
+def _share(v):
+    s = float(np.sum(v))
+    return v / s if s > 0 else v
+
+
+# v3 blend weights (equal footing for the three independent signals;
+# voter support counts half — it re-uses the same models' hard picks)
+W_PROBMASS, W_DIGITBIN, W_FREQ, W_VOTER = 1.0, 1.0, 1.0, 0.5
+PARITY_BONUS = 0.005   # tie-breaker scale only (Kass's 2-1 preference)
+
+
+def digit_scores(models, x, past_draws, votes):
+    """Blended per-digit score in [0,1]-share units. Components:
+    probmass (RF+GB expected counts), digitbin (per-digit binary
+    classifiers), freq (inclusion frequency over the last 180 draws),
+    voter (share of the 4 voters whose triple contains the digit)."""
+    pm = _share(_expected_counts(models["rf"], x)
+                + _expected_counts(models["gb"], x))
+    db = np.zeros(10)
+    for d in range(10):
+        pr = models["rfb"][d].predict_proba(x)[0]
+        pg = models["gbb"][d].predict_proba(x)[0]
+        db[d] = (pr[list(models["rfb"][d].classes_).index(1)]
+                 + pg[list(models["gbb"][d].classes_).index(1)]) / 2.0
+    db = _share(db)
+    incl = np.array([np.mean([1.0 if d in dr[2:] else 0.0
+                              for dr in past_draws[-180:]])
+                     for d in range(10)])
+    fq = _share(incl)
+    vt = _share(np.array([sum(1 for v in votes.values() if d in v)
+                          for d in range(10)], dtype=float))
+    return (W_PROBMASS * pm + W_DIGITBIN * db + W_FREQ * fq
+            + W_VOTER * vt) / (W_PROBMASS + W_DIGITBIN + W_FREQ + W_VOTER)
+
+
+def pick_set(scores, parity_bonus=PARITY_BONUS):
+    """Best 3-DISTINCT-digit set by summed score, over all 120 combos.
+    A distinct set is the provably best pattern class under order-free
+    scoring (0.60% box / 0.813 expected digits vs 0.30% / 0.570 pair)."""
+    best, best_val = None, -1e18
+    for combo in itertools.combinations(range(10), 3):
+        val = float(sum(scores[d] for d in combo))
+        if sum(1 for d in combo if d % 2 == 0) in (1, 2):
+            val += parity_bonus
+        if val > best_val:
+            best, best_val = combo, val
+    return best
+
+
 def predict_next(models, past_draws, target_date, target_is_eve,
-                 features="v2"):
-    """Ensemble vote of hot / RF / GB / LSTM. Returns sorted triple."""
+                 features="v2", style="v3"):
+    """Returns (guess, votes). style='v3' (live): blended digit-score
+    set selection, always 3 distinct digits. style='vote': the v2
+    majority vote over whole triples (kept for backtest A/B)."""
     feat = featurize if features == "v2" else featurize_v1
     past_digits = [d[2:] for d in past_draws]
     x = feat(past_digits, target_date, target_is_eve).reshape(1, -1)
@@ -324,14 +501,17 @@ def predict_next(models, past_draws, target_date, target_is_eve,
              "rf": tuple(int(models["rf"][p].predict(x)[0]) for p in range(3)),
              "gb": tuple(int(models["gb"][p].predict(x)[0]) for p in range(3)),
              "lstm": models["lstm"].predict([list(d) for d in past_digits[-10:]])}
-    counts = {}
-    for v in votes.values():
-        counts[v] = counts.get(v, 0) + 1
-    # majority vote; tie-break toward RF, then GB, then LSTM, then hot
-    order = [votes["rf"], votes["gb"], votes["lstm"], votes["hot"]]
-    best = max(counts.items(),
-               key=lambda kv: (kv[1], -order.index(kv[0]) if kv[0] in order else 9))
-    return best[0], votes
+    if style == "vote" or "rfb" not in models:
+        counts = {}
+        for v in votes.values():
+            counts[v] = counts.get(v, 0) + 1
+        # majority vote; tie-break toward RF, then GB, then LSTM, then hot
+        order = [votes["rf"], votes["gb"], votes["lstm"], votes["hot"]]
+        best = max(counts.items(),
+                   key=lambda kv: (kv[1], -order.index(kv[0])
+                                   if kv[0] in order else 9))
+        return best[0], votes
+    return pick_set(digit_scores(models, x, past_draws, votes)), votes
 
 
 def parity_tweak(guess, votes, past_draws):
@@ -372,6 +552,7 @@ def backtest(df, features="v2", n_test=600, retrain_every=50):
     draws = draws_list(df)
     start = len(draws) - n_test
     lanes = {name: [0, 0] for name in LANES}   # [box, digits]
+    v2vote = [0, 0]   # v2 majority-vote ensemble, A/B against v3 selector
     rng = random.Random(1234)
     rand = [0, 0]
     models, trained_at = None, -10 ** 9
@@ -387,7 +568,12 @@ def backtest(df, features="v2", n_test=600, retrain_every=50):
         past = draws[:idx]
         guess, _ = predict_next(models, past, date, draw == "eve",
                                 features=features)
+        guess_vote, _ = predict_next(models, past, date, draw == "eve",
+                                     features=features, style="vote")
         actual = target_of(draws[idx])
+        box, hits = score_order_free(guess_vote, actual)
+        v2vote[0] += box
+        v2vote[1] += hits
         all_guesses = {"ensemble": guess, **lane_guesses(past, date, draw)}
         for name, g in all_guesses.items():
             box, hits = score_order_free(g, actual)
@@ -406,6 +592,9 @@ def backtest(df, features="v2", n_test=600, retrain_every=50):
               f"{hits / n_test:.3f}")
     print(f"{'pure-rng':>10} | {rand[0]:>4}/{n_test} = {rand[0] / n_test:6.3%} | "
           f"{rand[1] / n_test:.3f}")
+    print(f"{'ens-v2vote':>10} | {v2vote[0]:>4}/{n_test} = "
+          f"{v2vote[0] / n_test:6.3%} | {v2vote[1] / n_test:.3f}   "
+          "(A/B: v2 majority vote, same models)")
     print("\nChance box-hit rate ~ 1/220 = 0.455% (uniform draws). Expected "
           "digits/draw for the seeded 'random' LANE differs from pure-rng "
           "only by seed luck — both are controls.")
@@ -469,7 +658,7 @@ def daily_run(only=None):
     restricts which upcoming draw gets predicted/logged; scoring and
     training always use everything in history. Splitting the runs lets
     the evening pick train on the same day's midday result."""
-    df = update_history()
+    df = update_history(wait_for_midday=(only == "eve"))
     draws = draws_list(df)
     print("[2/6] Scoring previous guesses + lanes...")
     score_pending(df)
@@ -484,7 +673,7 @@ def daily_run(only=None):
             continue
         guess, parts = predict_next(models, draws, pd.Timestamp(date),
                                     draw == "eve")
-        guess, tweaked = parity_tweak(guess, parts, draws)
+        tweaked = False   # v3 selector replaced the parity tweak
         new_rows.append({"date": str(date), "draw": draw,
                          "g1": guess[0], "g2": guess[1], "g3": guess[2],
                          "hot": "".join(map(str, parts["hot"])),
