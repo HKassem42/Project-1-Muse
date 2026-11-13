@@ -55,6 +55,14 @@ you need for it to be better"):
     expected counts), the engine now also trains per-digit BINARY
     classifiers — "does digit d appear in the next draw?" — which is
     the quantity the order-free score actually rewards.
+
+v3.1 changes (2026-11-12, Kass: "DO WHATEVER TO GET US OUR FIRST 3/3"):
+  - COVERAGE PLAY: per draw the engine also logs the top-10 ranked
+    distinct-digit sets (logs/coverage.csv), scored as a play: best
+    digits over the 10 sets, and boxed = any set hit 3/3. Exact math:
+    K distinct sets cover 6K of 1,000 ordered outcomes, so the Ten
+    boxes at 6.0%/draw (expected wait ~8 days at 2 draws/day) vs
+    0.6% for the single pick. The single headline pick is unchanged.
 """
 import argparse
 import hashlib
@@ -81,6 +89,8 @@ BASE = Path(__file__).parent
 DATA_FILE = BASE / "data" / "history.csv"
 LOG_FILE = BASE / "logs" / "guesses.csv"
 LANES_FILE = BASE / "logs" / "lanes.csv"
+COVERAGE_FILE = BASE / "logs" / "coverage.csv"
+COVERAGE_K = 10      # coverage play: top-K ranked sets per draw (v3.1)
 MODEL_DIR = BASE / "models"
 TRAIN_N = 1000       # draws used to train the ML models
 MIN_PAST = 180       # history needed before a sample's features are full
@@ -475,18 +485,56 @@ def digit_scores(models, x, past_draws, votes):
             + W_VOTER * vt) / (W_PROBMASS + W_DIGITBIN + W_FREQ + W_VOTER)
 
 
-def pick_set(scores, parity_bonus=PARITY_BONUS):
-    """Best 3-DISTINCT-digit set by summed score, over all 120 combos.
-    A distinct set is the provably best pattern class under order-free
-    scoring (0.60% box / 0.813 expected digits vs 0.30% / 0.570 pair)."""
-    best, best_val = None, -1e18
+def ranked_sets(scores, k=COVERAGE_K, parity_bonus=PARITY_BONUS):
+    """All 120 distinct-digit sets ranked by summed digit score
+    (plus the tie-breaker parity bonus), best first. Ties break by the
+    set itself, so the ranking is deterministic. The headline pick is
+    rank 1; the coverage play (v3.1) plays the top COVERAGE_K."""
+    vals = []
     for combo in itertools.combinations(range(10), 3):
         val = float(sum(scores[d] for d in combo))
         if sum(1 for d in combo if d % 2 == 0) in (1, 2):
             val += parity_bonus
-        if val > best_val:
-            best, best_val = combo, val
-    return best
+        vals.append((val, combo))
+    vals.sort(key=lambda vc: (-vc[0], vc[1]))
+    return [c for _, c in vals[:k]]
+
+
+def pick_set(scores, parity_bonus=PARITY_BONUS):
+    """Best 3-DISTINCT-digit set by summed score, over all 120 combos.
+    A distinct set is the provably best pattern class under order-free
+    scoring (0.60% box / 0.813 expected digits vs 0.30% / 0.570 pair)."""
+    return ranked_sets(scores, k=1, parity_bonus=parity_bonus)[0]
+
+
+def predict_ranked(models, past_draws, target_date, target_is_eve,
+                   features="v2"):
+    """Top-COVERAGE_K ranked sets for a target draw (coverage play).
+    Returns (ranked_sets, votes). Needs the v3 digit-binary models;
+    returns ([], votes) when they are absent."""
+    feat = featurize if features == "v2" else featurize_v1
+    past_digits = [d[2:] for d in past_draws]
+    x = feat(past_digits, target_date, target_is_eve).reshape(1, -1)
+    votes = {"hot": tuple(models["hot"]),
+             "rf": tuple(int(models["rf"][p].predict(x)[0]) for p in range(3)),
+             "gb": tuple(int(models["gb"][p].predict(x)[0]) for p in range(3)),
+             "lstm": models["lstm"].predict([list(d) for d in past_digits[-10:]])}
+    if "rfb" not in models:
+        return [], votes
+    scores = digit_scores(models, x, past_draws, votes)
+    return ranked_sets(scores), votes
+
+
+def score_coverage_guess(sets, actual):
+    """Score a coverage play against an actual draw. Returns
+    (best_digits, boxed, best_set): the best digits_right over the
+    played sets, whether any set boxed (3/3), and the best set."""
+    best_hits, best_set = -1, None
+    for s in sets:
+        _, hits = score_order_free(s, actual)
+        if hits > best_hits:
+            best_hits, best_set = hits, s
+    return best_hits, 1 if best_hits == 3 else 0, best_set
 
 
 def predict_next(models, past_draws, target_date, target_is_eve,
@@ -650,6 +698,26 @@ def score_pending(df):
                 changed = True
         if changed:
             lanes.to_csv(LANES_FILE, index=False)
+    if COVERAGE_FILE.exists():
+        cov = pd.read_csv(COVERAGE_FILE, dtype=str)
+        changed = False
+        for idx, row in cov.iterrows():
+            if pd.notna(row.get("boxed")) and str(row.get("boxed")) != "":
+                continue
+            key = (pd.Timestamp(row["date"]).date(), row["draw"])
+            if key in hist:
+                sets = [tuple(int(c) for c in s.zfill(3))
+                        for s in str(row["sets"]).split(";") if s]
+                hits, boxed, best = score_coverage_guess(sets, hist[key])
+                cov.loc[idx, "best_digits"] = str(hits)
+                cov.loc[idx, "boxed"] = str(boxed)
+                cov.loc[idx, "best_set"] = "".join(map(str, best))
+                changed = True
+                print(f"  scored coverage {key[0]} {key[1]}: best "
+                      f"{''.join(map(str, best))} digits={hits}/3 "
+                      f"boxed={boxed}")
+        if changed:
+            cov.to_csv(COVERAGE_FILE, index=False)
     return hist
 
 
@@ -666,13 +734,23 @@ def daily_run(only=None):
     models = train_models(draws)
     print(f"  hot baseline: {''.join(map(str, models['hot']))} | "
           f"lstm final loss: {models['lstm'].final_loss:.3f}")
-    print("[4/6] Predicting next draws (ensemble + lanes)...")
-    new_rows, lane_rows = [], []
+    print("[4/6] Predicting next draws (ensemble + lanes + coverage)...")
+    new_rows, lane_rows, cov_rows = [], [], []
     for date, draw in next_draws(df):
         if only and draw != only:
             continue
         guess, parts = predict_next(models, draws, pd.Timestamp(date),
                                     draw == "eve")
+        ranked, _ = predict_ranked(models, draws, pd.Timestamp(date),
+                                   draw == "eve")
+        if ranked:
+            cov_rows.append({"date": str(date), "draw": draw,
+                             "sets": ";".join("".join(map(str, s))
+                                              for s in ranked),
+                             "best_digits": "", "boxed": "",
+                             "best_set": ""})
+            print(f"  coverage{len(ranked)}: "
+                  + " ".join("".join(map(str, s)) for s in ranked))
         tweaked = False   # v3 selector replaced the parity tweak
         new_rows.append({"date": str(date), "draw": draw,
                          "g1": guess[0], "g2": guess[1], "g3": guess[2],
@@ -713,6 +791,16 @@ def daily_run(only=None):
             axis=1)]
         lane_df = pd.concat([old, lane_df], ignore_index=True)
     lane_df.to_csv(LANES_FILE, index=False)
+    cov_df = pd.DataFrame(cov_rows, columns=["date", "draw", "sets",
+                                             "best_digits", "boxed",
+                                             "best_set"])
+    if COVERAGE_FILE.exists():
+        old = pd.read_csv(COVERAGE_FILE, dtype=str)
+        seen = set(zip(old["date"].astype(str), old["draw"].astype(str)))
+        cov_df = cov_df[~cov_df.apply(
+            lambda r: (str(r["date"]), str(r["draw"])) in seen, axis=1)]
+        cov_df = pd.concat([old, cov_df], ignore_index=True)
+    cov_df.to_csv(COVERAGE_FILE, index=False)
     print("[6/6] Scoreboards")
     logs = pd.read_csv(LOG_FILE, dtype=str)
     done = logs[pd.to_numeric(logs["box_hit"], errors="coerce").notna()]
@@ -729,6 +817,17 @@ def daily_run(only=None):
             dd = pd.to_numeric(grp["digits_right"]).mean()
             print(f"  lane {name:>10}: box {int(bb)}/{len(grp)} | "
                   f"digits {dd:.2f}/3")
+    if COVERAGE_FILE.exists():
+        cov = pd.read_csv(COVERAGE_FILE, dtype=str)
+        csc = cov[pd.to_numeric(cov["boxed"], errors="coerce").notna()]
+        if len(csc):
+            bx = pd.to_numeric(csc["boxed"]).sum()
+            bd = pd.to_numeric(csc["best_digits"]).mean()
+            ge1 = (pd.to_numeric(csc["best_digits"]) >= 1).mean()
+            ge2 = (pd.to_numeric(csc["best_digits"]) >= 2).mean()
+            print(f"  coverage{COVERAGE_K} live: 3/3 hits {int(bx)}/"
+                  f"{len(csc)} | best digits {bd:.2f}/3 | "
+                  f"1+ in {ge1:.0%}, 2+ in {ge2:.0%} of draws")
 
 
 if __name__ == "__main__":

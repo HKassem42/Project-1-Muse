@@ -50,6 +50,13 @@ backfill (verified) → scrape → features → train → predict → log → sc
 - **Strategy lanes** — independent guesses per draw from hot / hot-digits /
   due-digits / pattern-sum strategies plus a seeded **random control**,
   each scored on its own scoreboard (`logs/lanes.csv`).
+- **Coverage play — "The Ten" (v3.1, 2026-11-12)** — each draw the engine
+  also ranks all 120 distinct-digit sets by the same blended score and
+  plays the top 10 (`logs/coverage.csv`), scored by its best set
+  (best digits right; boxed = any set hit 3/3). Ten distinct sets cover
+  exactly 60 of 1,000 ordered outcomes, so the play boxes at 6.0%/draw
+  by arithmetic — the single pick's 0.6% × 10 — independent of any
+  prediction skill. The headline single pick is unchanged.
 - **Logger** — predicts the next draws, saves guesses to `logs/guesses.csv`,
   and auto-scores them when actuals arrive (`box_hit`, `digits_right`).
 

@@ -8,9 +8,10 @@ import numpy as np
 import pandas as pd
 
 import scraper
-from lotto_muse import (PARITY_BONUS, _expected_counts, _merge_frames,
-                        featurize, lane_due, lane_hotdigits, lane_random,
-                        load_history, pick_set, score_order_free, target_of)
+from lotto_muse import (COVERAGE_K, PARITY_BONUS, _expected_counts,
+                        _merge_frames, featurize, lane_due, lane_hotdigits,
+                        lane_random, load_history, pick_set, ranked_sets,
+                        score_coverage_guess, score_order_free, target_of)
 
 
 def test_feature_dim():
@@ -157,6 +158,38 @@ def test_expected_counts_stub():
                             Stub([2, 5], [0.25, 0.75])], np.zeros((1, 3)))
     assert abs(out[0] - 0.5) < 1e-9 and abs(out[2] - 0.45) < 1e-9
     assert abs(out[5] - 0.75) < 1e-9 and abs(out.sum() - 2.0) < 1e-9
+
+
+def test_ranked_sets_topk_and_top1():
+    import itertools as _it
+    import random as _r
+    rng = _r.Random(11)
+    for _ in range(60):
+        scores = np.array([rng.random() for _ in range(10)])
+        ranked = ranked_sets(scores, k=COVERAGE_K)
+        assert len(ranked) == COVERAGE_K and len(set(ranked)) == COVERAGE_K
+        assert all(len(set(s)) == 3 for s in ranked)
+        assert ranked[0] == pick_set(scores)
+        vals = sorted((sum(scores[d] for d in c)
+                       + (PARITY_BONUS if sum(1 for d in c if d % 2 == 0)
+                          in (1, 2) else 0.0),
+                       c) for c in _it.combinations(range(10), 3))
+        top = [c for _, c in sorted(vals, key=lambda vc: (-vc[0], vc[1]))
+               [:COVERAGE_K]]
+        assert ranked == top
+        assert ranked_sets(scores, k=COVERAGE_K) == ranked  # deterministic
+
+
+def test_score_coverage_guess_cases():
+    sets = [(0, 6, 9), (0, 6, 8), (1, 6, 9), (2, 3, 9)]
+    hits, boxed, best = score_coverage_guess(sets, (6, 9, 0))
+    assert (hits, boxed, best) == (3, 1, (0, 6, 9))       # a set boxed
+    hits, boxed, best = score_coverage_guess(sets, (0, 6, 7))
+    assert (hits, boxed) == (2, 0) and best in ((0, 6, 9), (0, 6, 8))
+    hits, boxed, _ = score_coverage_guess(sets, (4, 5, 7))
+    assert (hits, boxed) == (0, 0)                        # nothing matched
+    hits, boxed, best = score_coverage_guess(sets, (9, 9, 6))
+    assert (hits, boxed) == (2, 0)   # pair in actual: multiset overlap 2
 
 
 def test_merge_existing_rows_always_win():
